@@ -1,0 +1,18 @@
+# Badminton Video Cut - Requirements
+
+# Core dependencies
+opencv-python>=4.5.0        # Video processing
+numpy>=1.20.0               # Numerical operations
+librosa>=0.9.0              # Audio analysis
+PyYAML>=6.0                 # YAML config support
+
+# Optional: YOLO player detection (auto_cut_player.py)
+ultralytics>=8.0.0          # YOLOv8
+
+# Optional: Progress bars
+tqdm>=4.65.0                # Progress bars for batch processing
+
+# Development (optional)
+# pytest>=7.0.0             # Testing
+# black>=22.0.0             # Code formatting
+# flake8>=4.0.0             # Linting

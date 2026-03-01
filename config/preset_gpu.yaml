@@ -1,0 +1,36 @@
+# GPU Accelerated Preset
+# Use this if you have an NVIDIA GPU
+# Fastest encoding with GPU acceleration
+
+motion:
+  sample_fps: 2
+  threshold: 8
+  audio_threshold: 0.04
+  min_duration: 3
+  merge_gap: 4
+
+optical_flow:
+  sample_fps: 3
+  threshold: 2.0
+  min_duration: 4
+  merge_gap: 4
+  center_crop: true
+
+player:
+  model: "yolov8s.pt"
+  sample_fps: 3
+  window_seconds: 1.5
+  threshold_ratio: 0.4
+  use_velocity_std: true
+
+export:
+  codec: "h264_nvenc"   # NVIDIA GPU encoding
+  preset: "p2"          # GPU preset (p1-p7, lower = faster)
+  crf: 19
+  audio_codec: "aac"
+  audio_bitrate: "192k"
+  use_gpu: true
+  faststart: true
+
+batch:
+  max_workers: 4

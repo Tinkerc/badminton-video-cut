@@ -1,0 +1,78 @@
+# Badminton Video Cut - Default Configuration
+# Copy this file and modify as needed for your use case.
+
+# =============================================================================
+# General Settings
+# =============================================================================
+general:
+  ffmpeg_path: "ffmpeg"           # FFmpeg executable path
+  ffprobe_path: "ffprobe"         # FFprobe executable path
+  log_level: "INFO"               # DEBUG, INFO, WARNING, ERROR
+
+# =============================================================================
+# Audio Extraction Settings
+# =============================================================================
+audio:
+  default_format: "wav"           # Default output format: wav, mp3, aac
+  sample_rate: 16000              # Sample rate for WAV (Hz)
+  channels: 1                     # Mono (1) or stereo (2)
+  use_copy: true                  # Prefer copy mode (fastest, lossless)
+  audio_bitrate: "192k"           # Bitrate for MP3/AAC
+
+# =============================================================================
+# Motion + Audio Detection Settings (auto_cut.py)
+# =============================================================================
+motion:
+  sample_fps: 2                   # Frames sampled per second
+  threshold: 8                    # Motion threshold (higher = less sensitive)
+  audio_threshold: 0.04           # Audio energy threshold
+  min_duration: 3                 # Minimum segment duration (seconds)
+  merge_gap: 4                    # Merge segments closer than this (seconds)
+
+# =============================================================================
+# Optical Flow Detection Settings (auto_cut_flow.py)
+# =============================================================================
+optical_flow:
+  sample_fps: 3                   # Frames sampled per second
+  scale_width: 320                # Resize width for analysis
+  scale_height: 180               # Resize height for analysis
+  threshold: 2.0                  # Flow score threshold
+  min_duration: 4                 # Minimum segment duration (seconds)
+  merge_gap: 4                    # Merge gap (seconds)
+  center_crop: true               # Analyze center 60% only (reduce noise)
+
+# =============================================================================
+# Player Detection Settings (auto_cut_player.py)
+# =============================================================================
+player:
+  model: "yolov8s.pt"             # YOLO model: yolov8n.pt, yolov8s.pt, yolov8m.pt
+  sample_fps: 3                   # Detection sampling rate
+  window_seconds: 1.5             # Sliding window size
+  threshold_ratio: 0.4            # Adaptive threshold ratio
+  use_velocity_std: true          # Use velocity std scoring
+  confidence: 0.5                 # YOLO detection confidence
+  iou: 0.7                        # YOLO IoU threshold
+
+# =============================================================================
+# Video Export Settings
+# =============================================================================
+export:
+  codec: "libx264"                # Video codec: libx264, libx265, h264_nvenc
+  preset: "veryfast"              # Encoding preset: ultrafast, veryfast, faster, fast, medium, slow
+  crf: 18                         # Quality: 0-51 (lower = better, 18-23 recommended)
+  audio_codec: "aac"              # Audio codec
+  audio_bitrate: "192k"           # Audio bitrate
+  use_gpu: false                  # Enable GPU encoding (requires NVENC)
+  faststart: true                 # Enable faststart for web playback
+
+# =============================================================================
+# Batch Processing Settings
+# =============================================================================
+batch:
+  max_workers: 4                  # Maximum parallel workers
+  video_patterns:                 # File patterns to process
+    - ".mp4"
+    - ".webm"
+    - ".mkv"
+    - ".avi"
+    - ".mov"

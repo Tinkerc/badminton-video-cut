@@ -1,0 +1,36 @@
+# High Quality Preset
+# Use this for final production highlights
+# Best quality, slower processing
+
+motion:
+  sample_fps: 4         # Higher sampling for better detection
+  threshold: 6          # Lower threshold = more sensitive
+  audio_threshold: 0.03
+  min_duration: 4       # Longer minimum segments
+  merge_gap: 5
+
+optical_flow:
+  sample_fps: 5
+  threshold: 1.5
+  min_duration: 4
+  merge_gap: 5
+  center_crop: true
+
+player:
+  model: "yolov8m.pt"   # Medium YOLO model (better accuracy)
+  sample_fps: 4
+  window_seconds: 2.0
+  threshold_ratio: 0.35
+  use_velocity_std: true
+
+export:
+  codec: "libx264"
+  preset: "slow"        # Slower encoding, better quality
+  crf: 15               # Higher quality (larger files)
+  audio_codec: "aac"
+  audio_bitrate: "256k"
+  use_gpu: false
+  faststart: true
+
+batch:
+  max_workers: 2        # Fewer parallel workers (more CPU per video)

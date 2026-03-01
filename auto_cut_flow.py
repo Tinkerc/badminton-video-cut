@@ -1,298 +1,252 @@
-import cv2
-import numpy as np
-import subprocess
-import os
+#!/usr/bin/env python3
+"""
+auto_cut_flow.py - Optical Flow Detection Video Cutter
+
+This script is now a thin wrapper around core.flow_detector.
+Original functionality is preserved for backward compatibility.
+
+Usage:
+    python auto_cut_flow.py input.mp4 output.mp4
+
+For more options, use the unified CLI:
+    badminton-cut flow input.mp4 output.mp4
+    badminton-cut flow --help
+"""
+
 import sys
+import os
+import argparse
 
-VIDEO = sys.argv[1]
-OUTPUT = sys.argv[2]
-
-# 参数（可调）
-SAMPLE_FPS = 3           # 每秒采样帧数（光流计算较重）
-SCALE_WIDTH = 320        # 缩放宽度
-SCALE_HEIGHT = 180       # 缩放高度
-THRESHOLD = 2.0          # 综合评分阈值
-MIN_DURATION = 4         # 最小保留秒数
-MERGE_GAP = 4            # 合并间隔秒数
-CENTER_CROP = True       # 是否只分析中心区域
+# Import core modules
+from core import OpticalFlowDetector, VideoExporter
+from config import Config
 
 
-def detect_optical_flow(video):
-
-    cap = cv2.VideoCapture(video)
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-
-    duration = total_frames / fps
-
-    step = int(fps / SAMPLE_FPS)
-
-    prev_gray = None
-
-    timeline = []
-
-    frame_id = 0
-
-    while True:
-
-        ret, frame = cap.read()
-
-        if not ret:
-            break
-
-        if frame_id % step != 0:
-            frame_id += 1
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, (SCALE_WIDTH, SCALE_HEIGHT))
-
-        # 中心裁剪（去除边缘干扰）
-        if CENTER_CROP:
-            h, w = gray.shape
-            gray = gray[
-                int(h * 0.2):int(h * 0.8),
-                int(w * 0.2):int(w * 0.8)
-            ]
-
-        if prev_gray is not None and prev_gray.shape == gray.shape:
-
-            # 计算光流
-            flow = cv2.calcOpticalFlowFarneback(
-                prev_gray,
-                gray,
-                None,
-                0.5,      # pyr_scale
-                3,        # levels
-                15,       # winsize
-                3,        # iterations
-                5,        # poly_n
-                1.2,      # poly_sigma
-                0         # flags
-            )
-
-            # 提取特征
-            features = extract_flow_features(flow)
-
-            t = frame_id / fps
-            timeline.append((t, features))
-
-        prev_gray = gray
-
-        frame_id += 1
-
-    cap.release()
-
-    return timeline, duration
+# Default parameters (for backward compatibility when no config file)
+DEFAULTS = {
+    "sample_fps": 3,
+    "threshold": 2.0,
+    "min_duration": 4,
+    "merge_gap": 4,
+    "center_crop": True
+}
 
 
-def extract_flow_features(flow):
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Optical Flow Detection Video Cutter"
+    )
+    
+    parser.add_argument(
+        "input",
+        help="Input video file"
+    )
+    
+    parser.add_argument(
+        "output",
+        nargs="?",
+        default=None,
+        help="Output video file (default: input_highlight.mp4)"
+    )
+    
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        default=None,
+        help="Configuration file"
+    )
+    
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help=f"Flow threshold (default: {DEFAULTS['threshold']})"
+    )
+    
+    parser.add_argument(
+        "--sample-fps",
+        type=int,
+        default=None,
+        help=f"Sample FPS (default: {DEFAULTS['sample_fps']})"
+    )
+    
+    parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=None,
+        help=f"Minimum segment duration in seconds (default: {DEFAULTS['min_duration']})"
+    )
+    
+    parser.add_argument(
+        "--merge-gap",
+        type=float,
+        default=None,
+        help=f"Merge gap in seconds (default: {DEFAULTS['merge_gap']})"
+    )
+    
+    parser.add_argument(
+        "--no-center-crop",
+        action="store_true",
+        help="Disable center crop (analyze full frame)"
+    )
+    
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Analyze only, don't cut video"
+    )
+    
+    parser.add_argument(
+        "--export-segments",
+        type=str,
+        default=None,
+        help="Export segments to file"
+    )
+    
+    parser.add_argument(
+        "--import-segments",
+        type=str,
+        default=None,
+        help="Import segments from file (skip detection)"
+    )
+    
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose output"
+    )
+    
+    return parser.parse_args()
 
-    # 提取dx, dy分量
-    dx = flow[:, :, 0]
-    dy = flow[:, :, 1]
 
-    # 计算速度
-    speed = np.sqrt(dx * dx + dy * dy)
-
-    # 平均速度
-    avg_speed = np.mean(speed)
-
-    # 速度标准差（运动模式复杂度）
-    flow_std = np.std(speed)
-
-    # 综合评分
-    score = avg_speed + 2 * flow_std
-
-    return {
-        'avg_speed': avg_speed,
-        'flow_std': flow_std,
-        'score': score
-    }
-
-
-def build_segments_flow(timeline):
-
+def load_segments(path):
+    """Load segments from file."""
     segments = []
-
-    start = None
-
-    for t, features in timeline:
-
-        score = features['score']
-
-        if score > THRESHOLD:
-
-            if start is None:
-                start = t
-
-        else:
-
-            if start is not None:
-
-                end = t
-
-                if end - start > MIN_DURATION:
-                    segments.append((start, end))
-
-                start = None
-
-    return segments
+    
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            
+            parts = line.split()
+            if len(parts) >= 2:
+                segments.append((float(parts[0]), float(parts[1])))
+    
+    return sorted(segments)
 
 
-def merge_segments(segments):
-
-    if not segments:
-        return []
-
-    merged = [segments[0]]
-
-    for s, e in segments[1:]:
-
-        last_s, last_e = merged[-1]
-
-        if s - last_e < MERGE_GAP:
-
-            merged[-1] = (last_s, e)
-
-        else:
-
-            merged.append((s, e))
-
-    return merged
+def save_segments(path, segments):
+    """Save segments to file."""
+    with open(path, "w") as f:
+        for start, end in sorted(segments):
+            f.write(f"{start:.1f} {end:.1f}\n")
 
 
-def cut_video(video, segments):
-
-    files = []
-
-    for i, (s, e) in enumerate(segments):
-
-        out = f"clip_{i}.mp4"
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i", video,
-            "-ss", str(s),
-            "-to", str(e),
-            "-c", "copy",
-            out
-        ]
-
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        files.append(out)
-
-    return files
-
-
-def concat(files, output):
-
-    with open("list.txt", "w") as f:
-
-        for file in files:
-            f.write(f"file '{file}'\n")
-
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", "list.txt",
-        "-c", "copy",
-        output
-    ]
-
-    subprocess.run(cmd)
-
-    os.remove("list.txt")
-
-    for f in files:
-        os.remove(f)
-
-
-def main():
-
-    print("=" * 60)
-    print("Optical Flow Video Cutter - Analysis Mode")
-    print("=" * 60)
+def print_summary(segments, duration):
+    """Print detection summary."""
     print()
-
-    print(f"Input video: {VIDEO}")
-    print(f"Output file: {OUTPUT}")
-    print()
-
-    print("Parameters:")
-    print(f"  - SAMPLE_FPS: {SAMPLE_FPS} (sample {SAMPLE_FPS} frames per second)")
-    print(f"  - SCALE: {SCALE_WIDTH}x{SCALE_HEIGHT} (downscale for speed)")
-    print(f"  - THRESHOLD: {THRESHOLD} (score threshold)")
-    print(f"  - MIN_DURATION: {MIN_DURATION}s (minimum segment duration)")
-    print(f"  - MERGE_GAP: {MERGE_GAP}s (merge segments closer than this)")
-    print(f"  - CENTER_CROP: {CENTER_CROP} (analyze center 60% only)")
-    print()
-
-    print("Detecting optical flow...")
-    timeline, duration = detect_optical_flow(VIDEO)
-
-    print(f"Video duration: {duration:.1f} seconds")
-    print(f"Optical flow samples: {len(timeline)} points")
-    print()
-
-    print("Building segments...")
-    segments = build_segments_flow(timeline)
-
-    print(f"Raw segments detected: {len(segments)}")
-    for i, (s, e) in enumerate(segments):
-        print(f"  Segment {i + 1}: {s:.1f}s -> {e:.1f}s (duration: {e - s:.1f}s)")
-    print()
-
-    segments = merge_segments(segments)
-
-    print(f"Merged segments: {len(segments)}")
-    print()
-
-    print("=" * 60)
-    print("Debug Output (filtered segments only):")
-    print("=" * 60)
-    print(f"{'Time':>5} | {'Speed':>6} | {'Std':>6} | {'Score':>6} | {'Keep':>4}")
-    print("-" * 50)
-
-    # Only show segments where Keep=NO
-    filtered_count = 0
-    for t, features in timeline:
-        speed = features['avg_speed']
-        std = features['flow_std']
-        score = features['score']
-        keep = "YES" if score > THRESHOLD else "NO"
-
-        if keep == "NO":
-            print(f"{t:5.1f} | {speed:6.2f} | {std:6.2f} | {score:6.2f} | {keep:>4}")
-            filtered_count += 1
-
-    print()
-    print(f"Filtered out: {filtered_count} / {len(timeline)} samples ({filtered_count / len(timeline) * 100:.1f}%)")
-    print()
-
     print("=" * 60)
     print("Final Segments to be cut:")
     print("=" * 60)
-
+    
     total_duration = 0
     for i, (s, e) in enumerate(segments):
         segment_duration = e - s
         total_duration += segment_duration
         print(f"Segment {i + 1:2d}: {s:7.1f}s -> {e:7.1f}s  (duration: {segment_duration:5.1f}s)")
-
+    
     print()
-    print("=" * 60)
     print(f"Total segments: {len(segments)}")
     print(f"Total output duration: {total_duration:.1f}s / {duration:.1f}s ({total_duration / duration * 100:.1f}%)")
     print(f"Time saved: {duration - total_duration:.1f}s ({(duration - total_duration) / duration * 100:.1f}%)")
     print("=" * 60)
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+    
+    # Load configuration
+    config_path = None
+    if args.config:
+        config_path = Path(args.config)
+    
+    config = Config.load(config_path)
+    
+    # Apply command-line overrides
+    if args.threshold is not None:
+        config.optical_flow.threshold = args.threshold
+    if args.sample_fps is not None:
+        config.optical_flow.sample_fps = args.sample_fps
+    if args.min_duration is not None:
+        config.optical_flow.min_duration = args.min_duration
+    if args.merge_gap is not None:
+        config.optical_flow.merge_gap = args.merge_gap
+    if args.no_center_crop:
+        config.optical_flow.center_crop = False
+    
+    # Print parameters
+    print("=" * 60)
+    print("Optical Flow Video Cutter")
+    print("=" * 60)
     print()
-    print("[DRY RUN] Skipping actual video cutting. Use '-c' flag to enable cutting.")
+    print(f"Input video: {args.input}")
+    print(f"Output file: {args.output if args.output else '(auto-generated)'}")
+    print()
+    print("Parameters:")
+    print(f"  - SAMPLE_FPS: {config.optical_flow.sample_fps}")
+    print(f"  - SCALE: {config.optical_flow.scale_width}x{config.optical_flow.scale_height}")
+    print(f"  - THRESHOLD: {config.optical_flow.threshold}")
+    print(f"  - MIN_DURATION: {config.optical_flow.min_duration}s")
+    print(f"  - MERGE_GAP: {config.optical_flow.merge_gap}s")
+    print(f"  - CENTER_CROP: {config.optical_flow.center_crop}")
+    print()
+    
+    # Initialize detector
+    detector = OpticalFlowDetector(config)
+    
+    # Import or detect segments
+    if args.import_segments:
+        print(f"Importing segments from: {args.import_segments}")
+        segments = load_segments(args.import_segments)
+    else:
+        print("Detecting optical flow...")
+        segments = detector.detect(args.input)
+    
+    # Export segments if requested
+    if args.export_segments:
+        print(f"Exporting segments to: {args.export_segments}")
+        save_segments(args.export_segments, segments)
+    
+    # Print summary
+    import cv2
+    cap = cv2.VideoCapture(args.input)
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = total_frames / fps
+    cap.release()
+    
+    print_summary(segments, duration)
+    
+    # Cut video or dry run
+    if args.dry_run:
+        print()
+        print("[DRY RUN] Skipping actual video cutting.")
+    else:
+        if not args.output:
+            base = os.path.splitext(os.path.basename(args.input))[0]
+            args.output = f"{base}_highlight.mp4"
+        
+        print()
+        print(f"Exporting to: {args.output}")
+        
+        exporter = VideoExporter(config)
+        exporter.cut(args.input, segments, args.output)
+        
+        print()
+        print(f"✓ Highlight video created: {args.output}")
 
 
 if __name__ == "__main__":

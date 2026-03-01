@@ -1,0 +1,36 @@
+# Balanced Preset (Default)
+# Good balance between speed and quality
+# Recommended for most use cases
+
+motion:
+  sample_fps: 2
+  threshold: 8
+  audio_threshold: 0.04
+  min_duration: 3
+  merge_gap: 4
+
+optical_flow:
+  sample_fps: 3
+  threshold: 2.0
+  min_duration: 4
+  merge_gap: 4
+  center_crop: true
+
+player:
+  model: "yolov8s.pt"   # Small YOLO model (good balance)
+  sample_fps: 3
+  window_seconds: 1.5
+  threshold_ratio: 0.4
+  use_velocity_std: true
+
+export:
+  codec: "libx264"
+  preset: "veryfast"
+  crf: 18
+  audio_codec: "aac"
+  audio_bitrate: "192k"
+  use_gpu: false
+  faststart: true
+
+batch:
+  max_workers: 4

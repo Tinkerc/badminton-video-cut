@@ -1,0 +1,36 @@
+# Fast Processing Preset
+# Use this for quick analysis and draft highlights
+# Trade quality for speed
+
+motion:
+  sample_fps: 1         # Lower sampling for faster detection
+  threshold: 10         # Higher threshold = fewer segments
+  audio_threshold: 0.05
+  min_duration: 2       # Shorter minimum segments
+  merge_gap: 3
+
+optical_flow:
+  sample_fps: 2
+  threshold: 2.5
+  min_duration: 2
+  merge_gap: 3
+  center_crop: true
+
+player:
+  model: "yolov8n.pt"   # Smallest YOLO model (fastest)
+  sample_fps: 2
+  window_seconds: 1.0
+  threshold_ratio: 0.5
+  use_velocity_std: true
+
+export:
+  codec: "libx264"
+  preset: "ultrafast"   # Fastest encoding
+  crf: 23               # Lower quality (smaller files)
+  audio_codec: "aac"
+  audio_bitrate: "128k"
+  use_gpu: false
+  faststart: true
+
+batch:
+  max_workers: 8        # More parallel workers
