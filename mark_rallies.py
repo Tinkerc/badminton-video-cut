@@ -45,6 +45,7 @@ Keyboard Controls:
 import cv2
 import sys
 import os
+import subprocess
 import time
 from typing import List, Tuple
 
@@ -55,6 +56,87 @@ BACK_SECONDS = 3  # Seconds to back up when auto-paused
 # Segment settings
 START_BACK_SECONDS = 1.0  # Auto-back 1s when starting recording
 MIN_SEGMENT_SECONDS = 2.0  # Minimum segment duration to save
+
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds as human-readable duration."""
+    if seconds >= 3600:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        s = int(seconds % 60)
+        return f"{h}h {m}m {s:02d}s"
+    if seconds >= 60:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m}m {s:02d}s"
+    return f"{seconds:.1f}s"
+
+
+def _build_export_cmd(video_path: str, segments: List[Tuple[float, float]],
+                      output_path: str, crf: int = 18, preset: str = "veryfast") -> list:
+    """Build FFmpeg filter_complex command for segment export."""
+    video_filters = []
+    audio_filters = []
+    for i, (start, end) in enumerate(segments):
+        video_filters.append(
+            f"[0:v]trim=start={start:.3f}:end={end:.3f},setpts=PTS-STARTPTS[v{i}]"
+        )
+        audio_filters.append(
+            f"[0:a]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS[a{i}]"
+        )
+    concat_labels = "".join([f"[v{i}][a{i}]" for i in range(len(segments))])
+    filter_complex = (
+        ";".join(video_filters + audio_filters) +
+        f";{concat_labels}concat=n={len(segments)}:v=1:a=1[outv][outa]"
+    )
+    return [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-filter_complex", filter_complex,
+        "-map", "[outv]", "-map", "[outa]",
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        output_path
+    ]
+
+
+def _export_segments(video_path: str, segments: List[Tuple[float, float]],
+                     output_path: str, crf: int = 18, preset: str = "veryfast") -> bool:
+    """Export segments to video file using FFmpeg filter_complex.
+    Returns True on success, False on failure."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    print(f"\nExporting {len(segments)} segments...")
+    cmd = _build_export_cmd(video_path, segments, output_path, crf, preset)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"\nExport failed (exit code {result.returncode})")
+        stderr_preview = result.stderr[-500:] if result.stderr else "(no stderr)"
+        print(f"FFmpeg error: {stderr_preview}")
+        print("Session file preserved. Retry with: python export_segments.py")
+        return False
+    if not os.path.exists(output_path):
+        print("\nExport failed: output file not created.")
+        print("Session file preserved. Retry with: python export_segments.py")
+        return False
+    size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"\nExport complete: {output_path} ({size_mb:.1f} MB)")
+    return True
+
+
+def _apply_padding(segments: List[Tuple[float, float]],
+                   start_pad: float = 0.0, end_pad: float = 0.0) -> List[Tuple[float, float]]:
+    """Apply start/end padding and merge overlapping segments."""
+    if not segments:
+        return []
+    padded = sorted([(max(0, s - start_pad), e + end_pad) for s, e in segments])
+    merged = [padded[0]]
+    for s, e in padded[1:]:
+        if s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    return merged
 
 
 class VideoPlayer:
@@ -256,6 +338,17 @@ class KeyboardController:
         ord('q'): 'quit',
         ord('Q'): 'quit',
         27: 'quit',  # ESC key
+
+        # Review navigation
+        13: 'confirm',           # Enter — next segment
+        8: 'back',               # Backspace (macOS)
+        127: 'back',             # Backspace (alternate)
+
+        # Export / Save from list mode
+        ord('e'): 'export',
+        ord('E'): 'export',
+        ord('s'): 'save',
+        ord('S'): 'save',
     }
 
     @staticmethod
@@ -294,8 +387,8 @@ def draw_overlay(frame, player: VideoPlayer, recorder: SegmentRecorder,
         cv2.putText(frame, f"PREVIEW: +/- adjust start | +/- adjust end | Space=done | P=pause",
                     (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
     elif mode == "LIST":
-        cv2.putText(frame, f"LIST: Up/Down select | Space=preview | P=pause",
-                    (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(frame, "LIST: Enter/Up/Down | Space=preview | E=export | S=save | U=delete",
+                    (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
     else:
         # Segment count (browse mode)
         cv2.putText(frame, f"Segments: {recorder.get_count()}",
@@ -376,8 +469,48 @@ def print_help():
     print(f"  Min segment: {MIN_SEGMENT_SECONDS}s (shorter ignored)")
     print(f"  Undo: Press U to remove last segment")
     print()
+    print("  Review mode (LIST):")
+    print("    Enter     - Next segment")
+    print("    Backspace - Previous segment")
+    print("    E         - Export")
+    print("    S         - Save")
+    print()
     print("=" * 60)
     print()
+
+
+def _load_session_segments(fpath: str) -> Tuple[List[Tuple[float, float]], str]:
+    """Load segments and video path from session file."""
+    segments = []
+    video_path = ""
+    with open(fpath, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("# VIDEO:"):
+                video_path = line[len("# VIDEO:"):].strip()
+                continue
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) == 2:
+                segments.append((float(parts[0]), float(parts[1])))
+    return sorted(segments), video_path
+
+
+def _parse_session_info(fpath: str) -> dict:
+    """Parse session file for metadata.
+    Returns dict: name, fpath, seg_count, highlight_duration, video_path, video_exists."""
+    name = os.path.splitext(os.path.basename(fpath))[0]
+    segments, video_path = _load_session_segments(fpath)
+    highlight = sum(e - s for s, e in segments)
+    return {
+        "name": name,
+        "fpath": fpath,
+        "seg_count": len(segments),
+        "highlight_duration": highlight,
+        "video_path": video_path,
+        "video_exists": bool(video_path) and os.path.exists(video_path),
+    }
 
 
 def _find_next_output_index(output_dir: str, base_name: str) -> int:
@@ -397,23 +530,66 @@ def _find_next_output_index(output_dir: str, base_name: str) -> int:
     return (max(indices) + 1) if indices else 1
 
 
-def _list_sessions(session_dir: str = "sessions") -> List[Tuple[str, str, int]]:
-    """List existing session files. Returns list of (basename, full_txt_path, seg_count)."""
+def _list_sessions(session_dir: str = "sessions") -> List[dict]:
+    """List existing sessions with metadata. Returns list of info dicts."""
     if not os.path.exists(session_dir):
         return []
     results = []
     for f in sorted(os.listdir(session_dir)):
         if f.endswith(".txt"):
             fpath = os.path.join(session_dir, f)
-            count = 0
-            with open(fpath, "r") as sf:
-                for line in sf:
-                    if line.strip():
-                        count += 1
-            if count > 0:
-                video_name = f[:-4]  # remove .txt
-                results.append((video_name, fpath, count))
+            info = _parse_session_info(fpath)
+            if info["seg_count"] > 0:
+                results.append(info)
     return results
+
+
+def _export_session_standalone(sessions: list):
+    """Export a session without entering the video player."""
+    print("\nWhich session to export?")
+    for i, s in enumerate(sessions):
+        print(f"  {i+1}. [{s['seg_count']} segments] {s['name']}")
+    choice = input("\nSelect [1]: ").strip()
+    try:
+        idx = int(choice) - 1 if choice else 0
+    except ValueError:
+        idx = 0
+
+    if not (0 <= idx < len(sessions)):
+        print("Invalid selection.")
+        return
+
+    s = sessions[idx]
+    if not s["video_exists"]:
+        print(f"Video not found: {s.get('video_path', 'N/A')}")
+        new_path = input("Enter video path: ").strip()
+        if new_path and os.path.exists(new_path):
+            video_path = os.path.abspath(new_path)
+        else:
+            print("File not found.")
+            return
+    else:
+        video_path = s["video_path"]
+
+    segments, _ = _load_session_segments(s["fpath"])
+    if not segments:
+        print("No segments to export.")
+        return
+
+    base_name = s["name"]
+    output_dir = "./output"
+    seq = _find_next_output_index(output_dir, base_name)
+    output_path = os.path.join(output_dir, f"{base_name}_{seq}.mp4")
+
+    print(f"\nVideo:    {video_path}")
+    print(f"Segments: {len(segments)} ({_format_duration(sum(e - s for s, e in segments))})")
+    print(f"Output:   {output_path}")
+
+    confirm = input("\nExport? [Y/n] ").strip().lower()
+    if confirm != 'n':
+        padded = _apply_padding(segments, start_pad=0.8, end_pad=1.2)
+        print(f"After padding: {len(padded)} segments ({_format_duration(sum(e - s for s, e in padded))})")
+        _export_segments(video_path, padded, output_path)
 
 
 def _select_session():
@@ -421,56 +597,60 @@ def _select_session():
     sessions = _list_sessions()
 
     print("=" * 60)
-    print("Badminton Video Cut - Session Manager")
+    print("Badminton Video Cut")
     print("=" * 60)
 
     if sessions:
-        print("\nHistory sessions:")
-        for i, (name, fpath, count) in enumerate(sessions):
-            print(f"  {i+1}. [{count} segments] {name}")
+        print()
+        for i, s in enumerate(sessions):
+            dur = _format_duration(s["highlight_duration"])
+            status = "video found" if s["video_exists"] else "video missing"
+            print(f"  {i+1}. [{s['seg_count']} segments] {s['name']}  highlight {dur}  {status}")
 
-        print(f"\n  N - New session (start a new video)")
+        print(f"\n  N - New video")
+        print("  E - Export existing session")
         print("  Q - Quit")
-        choice = input("Select [1] or N or Q: ").strip()
+        choice = input("\nSelect [1]: ").strip()
 
         if choice.upper() == 'Q':
             sys.exit(0)
 
-        if choice.upper() == 'N' or choice == '':
+        if choice.upper() == 'N':
             return _new_session()
 
+        if choice.upper() == 'E':
+            _export_session_standalone(sessions)
+            sys.exit(0)
+
         try:
-            idx = int(choice) - 1
-            if 0 <= idx < len(sessions):
-                name, fpath, count = sessions[idx]
-                # Read real video path from session file header
-                video_path = None
-                with open(fpath, "r") as sf:
-                    for line in sf:
-                        if line.startswith("# VIDEO:"):
-                            video_path = line.strip().split("# VIDEO:", 1)[1].strip()
-                            break
-                if video_path and os.path.exists(video_path):
-                    print(f"\nResuming: {name} ({count} segments)")
-                    return video_path
-                elif video_path:
-                    print(f"Video not found: {video_path}")
-                    print("Please enter the correct path:")
-                    new_path = input("  Video path: ").strip()
-                    if new_path and os.path.exists(new_path):
-                        return os.path.abspath(new_path)
-                    print("File not found. Exiting.")
-                    sys.exit(1)
-                else:
-                    print("No video path in session file. Exiting.")
-                    sys.exit(1)
+            idx = int(choice) - 1 if choice else 0
         except ValueError:
-            pass
+            idx = 0
+
+        if 0 <= idx < len(sessions):
+            s = sessions[idx]
+            if s["video_exists"]:
+                print(f"\nResuming: {s['name']} ({s['seg_count']} segments)")
+                return s["video_path"]
+            elif s["video_path"]:
+                print(f"Video not found: {s['video_path']}")
+                new_path = input("Enter correct video path: ").strip()
+                if new_path and os.path.exists(new_path):
+                    return os.path.abspath(new_path)
+                print("File not found. Exiting.")
+                sys.exit(1)
+            else:
+                print("No video path in session file.")
+                new_path = input("Enter video path: ").strip()
+                if new_path and os.path.exists(new_path):
+                    return os.path.abspath(new_path)
+                print("File not found. Exiting.")
+                sys.exit(1)
 
         print("Invalid choice, exiting.")
         sys.exit(1)
     else:
-        print("\nNo history sessions found.")
+        print("\nNo sessions found.")
         return _new_session()
 
 
@@ -546,22 +726,31 @@ def main():
     paused = False
     pending_key = None
 
-    # Create window only if mode needs video display
     window_name = "Phase-H Rally Marker"
-    if mode != "LIST":
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     # Main loop
     while True:
         if mode == "LIST":
-            # LIST mode: only read keys, no video display
+            # LIST mode: show selected segment's frame with overlay, read keys
+            segments = recorder.get_segments()
+            if segments:
+                seg = recorder.get_at_index(selected_index)
+                if seg:
+                    target_frame = int(seg[0] * player.fps)
+                    player.cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                    player.current_frame = target_frame
+                    ret, frame = player.cap.read()
+                    if ret:
+                        frame = draw_overlay(frame, player, recorder, mode, selected_index, preview_seg)
+                        cv2.imshow(window_name, frame)
+
             key = cv2.waitKey(100) & 0xFF
             if key == 255:
                 continue
             last_key_time = time.time()
             action = KeyboardController.get_action(key)
 
-            # Global actions
             if action == 'quit':
                 print("Exiting...")
                 recorder.finalize(player.get_current_time())
@@ -569,15 +758,17 @@ def main():
 
             if action == 'toggle_list':  # R = back to browse
                 mode = "BROWSE"
-                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                paused = False
                 print("Back to BROWSE mode")
                 continue
 
-            # LIST-specific: select/delete/preview
-            segments = recorder.get_segments()
-            if action == 'up':
+            if not segments:
+                continue
+
+            # Navigation
+            if action in ('up', 'back'):  # Up or Backspace — previous
                 selected_index = max(0, selected_index - 1)
-            elif action == 'down':
+            elif action in ('down', 'confirm'):  # Down or Enter — next
                 selected_index = min(len(segments) - 1, selected_index + 1)
             elif action == 'toggle':  # Space = preview selected
                 seg = recorder.get_at_index(selected_index)
@@ -593,10 +784,21 @@ def main():
                 if removed:
                     print(f"DELETED: {removed[0]:.1f}s - {removed[1]:.1f}s")
                     recorder._auto_save()
-                    selected_index = min(selected_index, len(recorder.get_segments()) - 1)
-                    selected_index = max(0, selected_index)
+                    selected_index = min(selected_index, max(0, len(recorder.get_segments()) - 1))
                 else:
                     print("No segments to delete.")
+            elif action == 'export':  # E = export from list mode
+                recorder._auto_save()
+                segs = recorder.get_segments()
+                if segs:
+                    total_dur = sum(e - s for s, e in segs)
+                    print(f"\n{len(segs)} segments, {_format_duration(total_dur)}")
+                    confirm = input("Export? [Y/n] ").strip().lower()
+                    if confirm != 'n':
+                        _export_segments(video_path, segs, output_path)
+            elif action == 'save':  # S = explicit save
+                recorder._auto_save()
+                print(f"Saved {recorder.get_count()} segments")
             continue
 
         # BROWSE / FIX / PREVIEW: video playback
@@ -604,8 +806,16 @@ def main():
 
         if not ret:
             if mode == "PREVIEW":
-                print(f"[Preview ended]")
-                mode = "LIST"
+                next_idx = selected_index + 1
+                if next_idx < recorder.get_count():
+                    selected_index = next_idx
+                    seg = recorder.get_at_index(selected_index)
+                    preview_seg = seg
+                    player.jump_seconds(seg[0] - 1)
+                    print(f"[Preview -> #{selected_index+1}] {seg[0]:.1f}s - {seg[1]:.1f}s")
+                else:
+                    print("[Review complete - last segment]")
+                    mode = "LIST"
                 recorder._auto_save()
                 continue
             # Video ended: finalize recording, pause at start
@@ -653,8 +863,16 @@ def main():
             # Preview mode: check if we've passed segment end
             if mode == "PREVIEW" and preview_seg:
                 if player.get_current_time() >= preview_seg[1]:
-                    print(f"[Preview ended]")
-                    mode = "LIST"
+                    next_idx = selected_index + 1
+                    if next_idx < recorder.get_count():
+                        selected_index = next_idx
+                        seg = recorder.get_at_index(selected_index)
+                        preview_seg = seg
+                        player.jump_seconds(seg[0] - 1)
+                        print(f"[Preview -> #{selected_index+1}] {seg[0]:.1f}s - {seg[1]:.1f}s")
+                    else:
+                        print("[Review complete - last segment]")
+                        mode = "LIST"
                     recorder._auto_save()
                     continue
             continue
@@ -784,21 +1002,29 @@ def main():
     cv2.destroyAllWindows()
 
     segments = recorder.get_segments()
-    print(f"Recorded {len(segments)} segments:")
-    total_duration = 0
-    for i, (s, e) in enumerate(segments):
-        duration = e - s
-        total_duration += duration
-        print(f"  {i+1}. {s:.1f}s -> {e:.1f}s  ({duration:.1f}s)")
-
-    print()
-    print(f"Total highlight duration: {total_duration:.1f}s")
-    print(f"Original duration: {player.duration:.1f}s")
-    print(f"Reduction: {(1 - total_duration/player.duration)*100:.1f}%")
-    print()
+    print(f"\nRecorded {len(segments)} segments")
 
     if segments:
-        print(f"Segments auto-saved to: {recorder._segments_file()}")
+        total_duration = sum(e - s for s, e in segments)
+        print(f"Total highlight duration: {_format_duration(total_duration)}")
+        print(f"Original duration: {_format_duration(player.duration)}")
+        if player.duration > 0:
+            reduction = (1 - total_duration / player.duration) * 100
+            print(f"Reduction: {reduction:.1f}%")
+        print()
+        print(f"Segments saved to: {recorder._segments_file()}")
+        print(f"Output video: {output_path}")
+        print()
+        print("Export settings:")
+        print(f"  Start padding: 0.8s")
+        print(f"  End padding:   1.2s")
+        print(f"  CRF: 18")
+        print(f"  Preset: veryfast")
+        print()
+        confirm = input("Export now? [Y/n] ").strip().lower()
+        if confirm != 'n':
+            padded = _apply_padding(segments, start_pad=0.8, end_pad=1.2)
+            _export_segments(video_path, padded, output_path)
     else:
         print("No segments recorded.")
 
